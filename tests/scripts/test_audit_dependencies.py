@@ -4,6 +4,7 @@ from datetime import date, datetime, timedelta, timezone
 import importlib.util
 import json
 from pathlib import Path
+import shutil
 import sys
 
 import pytest
@@ -291,4 +292,30 @@ def test_x509_exceptions_record_upstream_scanner_range_discrepancy() -> None:
         analysis = by_id[advisory_id]["analysis"]
         assert "publisher advisory defines the affected range as <=48.0.0" in analysis
         assert f"pip-audit reports {advisory_id} against 48.0.1" in analysis
+        assert "Treat 48.0.1 conservatively as affected at package level" in analysis
+        assert "not evidence of a backported fix" in analysis
         assert by_id[advisory_id]["forbidden_import_prefixes"] == ["cryptography.x509"]
+
+
+@pytest.mark.parametrize("source", [
+    "from cryptography.hazmat.primitives.serialization import pkcs7\n",
+    "from cryptography import x509\n",
+    'import importlib\nimportlib.import_module("cryptography.x509.verification")\n',
+    '__import__("cryptography.hazmat.primitives.serialization.pkcs7")\n',
+])
+def test_reviewed_exceptions_reject_new_vulnerable_paths(tmp_path, source) -> None:
+    # Exercise the complete ledger loader with an additional first-party module,
+    # rather than testing only the import-name helper in isolation.
+    paths = {"requirements.lock", "requirements-dev.lock",
+             "control-plane/manifests/vulnerability-exceptions.json"}
+    for record in _document()["exceptions"]:
+        paths.update(record["evidence_paths"])
+    for relative in paths:
+        target = tmp_path / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(ROOT / relative, target)
+    for scope in audit.EXPECTED_CODE_SCOPE:
+        (tmp_path / scope).mkdir(exist_ok=True)
+    (tmp_path / "scripts/new_path.py").write_text(source, encoding="utf-8")
+    with pytest.raises(audit.DependencyAuditError, match="execution-path guard failed"):
+        audit.load_exceptions(tmp_path, AS_OF)
